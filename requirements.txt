@@ -4,3 +4,4 @@ openrouteservice
 ortools
 folium
 streamlit-folium
+openpyxl
