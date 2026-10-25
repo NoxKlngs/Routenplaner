@@ -1,7 +1,7 @@
-"""Stabilisierte Tagesplanung für den Münchner Routenplaner.
+"""Stabilisierte Tagesplanung für Bayern und Österreich.
 
-Starten mit: streamlit run routenplaner_stabilisiert.py
-Konfiguration des Login-Passworts siehe README_Routenplaner.txt.
+Starten mit: streamlit run Routenplaner_Madame_Update_mit_Tagesbericht_TXT.py
+Konfiguration des Login-Passworts siehe README.txt.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from streamlit_folium import st_folium
 # ---------------------------------------------------------------------------
 # Grundkonfiguration
 # ---------------------------------------------------------------------------
-st.set_page_config(page_title="Routenplaner München", layout="wide")
+st.set_page_config(page_title="Routenplaner Bayern & Österreich", layout="wide")
 
 GEOCODING_URL = "https://api.heigit.org/pelias/v1/search"
 MATRIX_URL = "https://api.heigit.org/openrouteservice/v2/matrix/driving-car"
@@ -181,22 +181,40 @@ def format_time(minutes: int) -> str:
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
-def match_vehicle_name(value: Any, vehicle_list: list[str]) -> int | None:
+def encode_readable_txt(content: str) -> bytes:
+    """Erzeugt eine lesbare Windows-Textdatei mit UTF-8-BOM und Windows-Zeilenumbrüchen."""
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\n", "\r\n")
+    return ("\ufeff" + normalized).encode("utf-8")
+
+
+def match_vehicle_name(
+    value: Any,
+    vehicle_list: list[str],
+    vehicle_aliases: dict[str, int] | None = None,
+) -> int | None:
+    """Ordnet Fahrzeugnamen fehlertolerant zu, auch wenn Dateien andere Bezeichnungen verwenden."""
     if is_blank(value):
         return None
     normalized_value = normalized_header(value).replace(" ", "")
+
+    if vehicle_aliases:
+        found_idx = vehicle_aliases.get(normalized_value)
+        if found_idx is not None and 0 <= found_idx < len(vehicle_list):
+            return found_idx
+
     for idx, vehicle_name in enumerate(vehicle_list):
         normalized_vehicle = normalized_header(vehicle_name).replace(" ", "")
         if normalized_value == normalized_vehicle:
             return idx
 
     # Tolerant gegenüber "Auto 1", "Fahrer 1", "1" und "Fahrzeug 01".
-    value_numbers = re.findall(r"\d+", str(value))
-    if value_numbers:
-        wanted_number = int(value_numbers[0])
+    value_nums = re.findall(r"\d+", str(value))
+    if value_nums:
+        wanted_number = int(value_nums[0])
         for idx, vehicle_name in enumerate(vehicle_list):
-            vehicle_numbers = re.findall(r"\d+", vehicle_name)
-            if vehicle_numbers and int(vehicle_numbers[0]) == wanted_number:
+            vehicle_nums = re.findall(r"\d+", vehicle_name)
+            if vehicle_nums and int(vehicle_nums[0]) == wanted_number:
                 return idx
     return None
 
@@ -205,6 +223,178 @@ def clean_address(value: Any) -> str:
     if is_blank(value):
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def discover_vehicle_names(
+    num_vehicles: int,
+    sources: list[tuple[str, Any]],
+) -> tuple[list[str], dict[str, int], list[str]]:
+    """Übernimmt Fahrzeugnamen aus Zusatzdateien und erstellt robuste Datei-Aliase.
+
+    Nummerierte Namen (z. B. "Fahrzeug 3") bleiben auf ihrem passenden Fahrzeugplatz.
+    Namen ohne Nummer werden in der Reihenfolge der Dateien den freien Plätzen zugeordnet.
+    """
+    slots: list[str | None] = [None] * num_vehicles
+    aliases: dict[str, int] = {}
+    unnumbered_names: list[str] = []
+    warnings: list[str] = []
+    out_of_range: set[str] = set()
+
+    for source_label, uploaded_file in sources:
+        if uploaded_file is None:
+            continue
+        try:
+            frame = load_file(uploaded_file)
+        except Exception as exc:
+            warnings.append(f"Fahrzeugnamen konnten aus {source_label} nicht gelesen werden: {exc}")
+            continue
+
+        vehicle_col = find_column(frame, ("fahrzeug", "auto", "fahrer", "vehicle", "driver"))
+        if vehicle_col is None:
+            continue
+
+        for raw_name in frame[vehicle_col].tolist():
+            if is_blank(raw_name):
+                continue
+            name = clean_address(raw_name)
+            key = normalized_header(name).replace(" ", "")
+            if not key:
+                continue
+
+            numbers = re.findall(r"\d+", name)
+            if numbers:
+                number = int(numbers[0])
+                if 1 <= number <= num_vehicles:
+                    idx = number - 1
+                    if slots[idx] is None:
+                        slots[idx] = name
+                    aliases.setdefault(key, idx)
+                else:
+                    out_of_range.add(name)
+                continue
+
+            # Dedupe cross-file repeats before assigning any name-only entries.
+            if key not in aliases and all(normalized_header(existing).replace(" ", "") != key for existing in unnumbered_names):
+                unnumbered_names.append(name)
+
+    # Fill still-empty slots with human-readable names that have no vehicle number.
+    for name in unnumbered_names:
+        key = normalized_header(name).replace(" ", "")
+        if key in aliases:
+            continue
+        try:
+            idx = slots.index(None)
+        except ValueError:
+            warnings.append(
+                f"Der Fahrzeugname '{name}' konnte keinem freien Fahrzeugplatz zugeordnet werden. "
+                "Bitte die Bezeichnung in den Zusatzdateien angleichen."
+            )
+            continue
+        slots[idx] = name
+        aliases[key] = idx
+
+    # Default labels fill gaps; all common numeric aliases continue to match those slots.
+    vehicle_names: list[str] = []
+    for idx, value in enumerate(slots):
+        default_name = f"Fahrzeug {idx + 1}"
+        vehicle_names.append(value or default_name)
+        aliases[normalized_header(default_name).replace(" ", "")] = idx
+        aliases[normalized_header(f"Auto {idx + 1}").replace(" ", "")] = idx
+        aliases[normalized_header(f"Fahrer {idx + 1}").replace(" ", "")] = idx
+        aliases[normalized_header(f"Vehicle {idx + 1}").replace(" ", "")] = idx
+        aliases[str(idx + 1)] = idx
+
+    if out_of_range:
+        warnings.append(
+            "Diese nummerierten Fahrzeuge liegen außerhalb der eingestellten Fahrzeuganzahl "
+            f"(1–{num_vehicles}) und können nicht verwendet werden: " + ", ".join(sorted(out_of_range))
+        )
+    return vehicle_names, aliases, warnings
+
+
+def parse_overnight_overrides(
+    uploaded_file: Any,
+    planungs_datum: date,
+    vehicle_list: list[str],
+    vehicle_aliases: dict[str, int] | None = None,
+) -> tuple[dict[int, str], list[str], bool]:
+    """Liest die Übernachtungsdatei und liefert Start-/Endadressen für den gewählten Tag.
+
+    Rückgabe: Fahrzeugindex -> Übernachtungsadresse, Warnungen, ob es Einträge
+    für den gewählten Planungstag gab.
+    """
+    if uploaded_file is None:
+        return {}, [], False
+
+    df = load_file(uploaded_file)
+    c_vehicle = find_column(df, ("fahrzeug", "auto", "fahrer"))
+    c_day = find_column(df, ("datum", "tag"))
+    c_address = find_column(df, ("adresse", "hotel", "unterkunft", "ort", "start", "strasse"))
+    if not (c_vehicle and c_day and c_address):
+        raise ValueError(
+            "Es müssen Spalten für Fahrzeug, Datum und Übernachtungsadresse vorhanden sein. "
+            f"Erkannt wurden: {', '.join(map(str, df.columns))}"
+        )
+
+    df = df.copy()
+    df["_datum_geparst"] = pd.to_datetime(df[c_day], errors="coerce").dt.normalize()
+    # Wenn Datumswerte im deutschen Format vorliegen (z. B. 25.10.2026),
+    # versuche nur die noch nicht erkannten Werte zusätzlich mit dayfirst=True.
+    missing_dates = df["_datum_geparst"].isna()
+    if missing_dates.any():
+        df.loc[missing_dates, "_datum_geparst"] = pd.to_datetime(
+            df.loc[missing_dates, c_day], errors="coerce", dayfirst=True
+        ).dt.normalize()
+    chosen_date = pd.Timestamp(planungs_datum).normalize()
+    overrides: dict[int, str] = {}
+    warnings: list[str] = []
+    unknown_vehicles: set[str] = set()
+    invalid_date_rows = 0
+    matching_date_rows = 0
+    empty_address_rows = 0
+    duplicate_vehicles: set[str] = set()
+
+    for _, row in df.iterrows():
+        row_date = row["_datum_geparst"]
+        if pd.isna(row_date):
+            invalid_date_rows += 1
+            continue
+        if row_date != chosen_date:
+            continue
+        matching_date_rows += 1
+        vehicle_value = row[c_vehicle]
+        vehicle_idx = match_vehicle_name(vehicle_value, vehicle_list, vehicle_aliases)
+        if vehicle_idx is None:
+            if not is_blank(vehicle_value):
+                unknown_vehicles.add(str(vehicle_value).strip())
+            continue
+        address = clean_address(row[c_address])
+        if not address:
+            empty_address_rows += 1
+            continue
+        if vehicle_idx in overrides:
+            duplicate_vehicles.add(vehicle_list[vehicle_idx])
+        overrides[vehicle_idx] = address
+
+    if unknown_vehicles:
+        warnings.append(
+            "Diese Fahrzeugnamen aus der Übernachtungsdatei wurden nicht zugeordnet: "
+            + ", ".join(sorted(unknown_vehicles))
+        )
+    if invalid_date_rows:
+        warnings.append(
+            f"{invalid_date_rows} Zeile(n) in der Übernachtungsdatei hatten ein ungültiges Datum und wurden ignoriert."
+        )
+    if empty_address_rows:
+        warnings.append(
+            f"{empty_address_rows} Eintrag/Einträge für den gewählten Tag hatten keine Adresse und wurden ignoriert."
+        )
+    if duplicate_vehicles:
+        warnings.append(
+            "Für diese Fahrzeuge gibt es mehrere Übernachtungsadressen am selben Tag; verwendet wird jeweils der letzte Eintrag: "
+            + ", ".join(sorted(duplicate_vehicles))
+        )
+    return overrides, warnings, matching_date_rows > 0
 
 
 def prepare_customer_table(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -397,40 +587,20 @@ def get_route_geometry(api_key: str, coords_tuple: tuple[tuple[float, float], ..
 # Benutzeroberfläche
 # ---------------------------------------------------------------------------
 st.title("🚚 Automatischer Routenplaner (Tagesplanung mit Live-Editor)")
-st.caption("Tagesplanung · mehrere Fahrzeuge · Zeitfenster · Urlaubsabgleich · Karten und CSV-Export")
+st.caption("Tagesplanung · Dateiübernahme für Fahrzeuge · editierbare Start-/Endadressen · Karten und übersichtliche Textberichte")
 
 st.sidebar.header("Einstellungen")
 api_key = st.sidebar.text_input("HeiGIT API-Key", type="password").strip()
 planungs_datum = st.sidebar.date_input("Planungs-Datum wählen", value=date.today())
 num_vehicles = int(st.sidebar.number_input("Anzahl der Fahrzeuge", min_value=1, max_value=10, value=5, step=1))
-service_time_mins = int(st.sidebar.number_input("Servicezeit pro Kunde (Minuten)", min_value=0, max_value=180, value=15, step=5))
+service_time_mins = int(st.sidebar.number_input("Servicezeit pro Kunde (Minuten)", min_value=0, max_value=180, value=60, step=5, key="service_time_mins_default60"))
 max_km_pro_tag = int(st.sidebar.number_input("Max. Kilometer pro Fahrzeug / Tag", min_value=50, max_value=1000, value=300, step=10))
 
-fahrzeug_namen = [f"Fahrzeug {i + 1}" for i in range(num_vehicles)]
 zeit_optionen = [f"{h:02d}:{m:02d}" for h in range(6, 23) for m in (0, 30)]
 
-st.subheader("🚐 1. Fahrzeuge (Depots & Schichtzeiten)")
-tabs = st.tabs(fahrzeug_namen)
-starts: list[str] = []
-ends: list[str] = []
-schicht_starts: list[str] = []
-schicht_ends: list[str] = []
-
-for i, tab in enumerate(tabs):
-    with tab:
-        col_a, col_b = st.columns(2)
-        with col_a:
-            start = st.text_input("Regulärer Start", value="Marienplatz 1, 80331 München", key=f"start_{i}")
-            shift_start = st.selectbox("Schichtbeginn", options=zeit_optionen, index=zeit_optionen.index("08:00"), key=f"svon_{i}")
-        with col_b:
-            end = st.text_input("Reguläres Ende", value="Marienplatz 1, 80331 München", key=f"end_{i}")
-            shift_end = st.selectbox("Schichtende", options=zeit_optionen, index=zeit_optionen.index("17:00"), key=f"sbis_{i}")
-        starts.append(clean_address(start))
-        ends.append(clean_address(end))
-        schicht_starts.append(shift_start)
-        schicht_ends.append(shift_end)
-
-st.subheader("📁 2. Kundendaten & Zusatzdateien")
+# Uploads are shown before the vehicle fields so the overnight addresses and names
+# can be reflected in the vehicle tabs immediately after selecting a file.
+st.subheader("📁 1. Kundendaten & Zusatzdateien")
 col1, col2 = st.columns(2)
 with col1:
     file_kunden = st.file_uploader("1. Kunden & Adressen (Pflicht – CSV/Excel)", type=["csv", "xlsx", "xls"])
@@ -438,6 +608,120 @@ with col1:
 with col2:
     file_urlaub = st.file_uploader("3. Urlaubsplanung (optional)", type=["csv", "xlsx", "xls"])
     file_uebernacht = st.file_uploader("4. Abweichender Start / Übernachtung (optional)", type=["csv", "xlsx", "xls"])
+
+fahrzeug_namen, vehicle_aliases, vehicle_name_warnings = discover_vehicle_names(
+    num_vehicles,
+    [
+        ("Gebietsdatei", file_gebiete),
+        ("Urlaubsdatei", file_urlaub),
+        ("Übernachtungsdatei", file_uebernacht),
+    ],
+)
+for warning in vehicle_name_warnings:
+    st.warning(warning)
+
+# Read the overnight file before drawing the vehicle controls. The resulting addresses
+# become the actual editable defaults shown in the vehicle section below.
+uebernacht_overrides: dict[int, str] = {}
+uebernacht_warnungen: list[str] = []
+uebernacht_datum_hat_eintraege = False
+if file_uebernacht is not None:
+    try:
+        uebernacht_overrides, uebernacht_warnungen, uebernacht_datum_hat_eintraege = parse_overnight_overrides(
+            file_uebernacht, planungs_datum, fahrzeug_namen, vehicle_aliases
+        )
+        for warning in uebernacht_warnungen:
+            st.warning(warning)
+        if uebernacht_overrides:
+            preview_rows = [
+                {
+                    "Fahrzeug": fahrzeug_namen[idx],
+                    "Übernommener Start": address,
+                    "Übernommenes Ende": address,
+                    "Planungsdatum": planungs_datum.strftime("%d.%m.%Y"),
+                }
+                for idx, address in sorted(uebernacht_overrides.items())
+            ]
+            st.success(
+                f"Übernachtungsdatei erkannt: {len(uebernacht_overrides)} Fahrzeug(e) werden für "
+                f"den {planungs_datum.strftime('%d.%m.%Y')} vorbelegt. "
+                "Die Adressen stehen unten direkt in den Fahrzeugfeldern und bleiben dort bearbeitbar."
+            )
+            st.dataframe(pd.DataFrame(preview_rows), hide_index=True, use_container_width=True)
+        elif not uebernacht_datum_hat_eintraege:
+            st.info(
+                f"In der Übernachtungsdatei gibt es keinen Eintrag für den {planungs_datum.strftime('%d.%m.%Y')}. "
+                "Die regulären Fahrzeugadressen werden angezeigt."
+            )
+        else:
+            st.warning(
+                "Es gibt Einträge für das gewählte Datum, aber keine gültige Fahrzeug-/Adresszuordnung. "
+                "Bitte die Fahrzeugnamen in den Zusatzdateien angleichen."
+            )
+    except Exception as exc:
+        st.warning(f"Übernachtungsdatei konnte nicht verarbeitet werden: {exc}. Die regulären Start-/Endadressen bleiben aktiv.")
+
+st.subheader("🚐 2. Fahrzeuge (Start-/Endadressen & Schichtzeiten)")
+tabs = st.tabs(fahrzeug_namen)
+starts: list[str] = []
+ends: list[str] = []
+schicht_starts: list[str] = []
+schicht_ends: list[str] = []
+
+# Keep regular depot edits when changing dates, but use a date/file-specific widget
+# for imported overnight addresses so they refresh correctly when the source changes.
+overnight_digest = (
+    hashlib.sha256(file_uebernacht.getvalue()).hexdigest()[:10]
+    if file_uebernacht is not None else "no-overnight-file"
+)
+for i, tab in enumerate(tabs):
+    with tab:
+        col_a, col_b = st.columns(2)
+        has_override = i in uebernacht_overrides
+        address_override = uebernacht_overrides.get(i, "")
+        if has_override:
+            override_signature = hashlib.sha256(
+                f"{planungs_datum}|{overnight_digest}|{address_override}".encode("utf-8")
+            ).hexdigest()[:10]
+            start_key = f"start_overnight_{i}_{override_signature}"
+            end_key = f"end_overnight_{i}_{override_signature}"
+            start_label = "Startadresse (aus Übernachtungsdatei)"
+            end_label = "Endadresse (aus Übernachtungsdatei)"
+        else:
+            start_key = f"start_regular_{i}"
+            end_key = f"end_regular_{i}"
+            start_label = "Regulärer Start"
+            end_label = "Reguläres Ende"
+
+        with col_a:
+            start = st.text_input(
+                start_label,
+                value=address_override if has_override else "Marienplatz 1, 80331 München",
+                key=start_key,
+            )
+            shift_start = st.selectbox(
+                "Schichtbeginn", options=zeit_optionen,
+                index=zeit_optionen.index("08:00"), key=f"svon_{i}",
+            )
+        with col_b:
+            end = st.text_input(
+                end_label,
+                value=address_override if has_override else "Marienplatz 1, 80331 München",
+                key=end_key,
+            )
+            shift_end = st.selectbox(
+                "Schichtende", options=zeit_optionen,
+                index=zeit_optionen.index("17:00"), key=f"sbis_{i}",
+            )
+        if has_override:
+            st.caption(
+                "📍 Für das gewählte Datum aus der Übernachtungsdatei übernommen. "
+                "Du kannst Start und Ende hier direkt anpassen."
+            )
+        starts.append(clean_address(start))
+        ends.append(clean_address(end))
+        schicht_starts.append(shift_start)
+        schicht_ends.append(shift_end)
 
 df_kunden: pd.DataFrame | None = None
 if file_kunden is not None:
@@ -546,7 +830,7 @@ if st.session_state.berechnen_geklickt:
                     chosen_date = pd.Timestamp(planungs_datum).normalize()
                     unknown_vehicles = set()
                     for _, row in df_u.iterrows():
-                        vehicle_idx = match_vehicle_name(row[c_vehicle], fahrzeug_namen)
+                        vehicle_idx = match_vehicle_name(row[c_vehicle], fahrzeug_namen, vehicle_aliases)
                         if vehicle_idx is None and not is_blank(row[c_vehicle]):
                             unknown_vehicles.add(str(row[c_vehicle]))
                             continue
@@ -559,34 +843,10 @@ if st.session_state.berechnen_geklickt:
             except Exception as exc:
                 st.warning(f"Urlaubsdatei konnte nicht sauber verarbeitet werden: {exc}. Bitte vor Verwendung der Tour prüfen.")
 
+        # Start- und Endadressen kommen direkt aus den oben sichtbaren Fahrzeugfeldern.
+        # Übernachtungsadressen sind dort bereits vorbelegt; manuelle Korrekturen bleiben erhalten.
         final_starts = list(starts)
         final_ends = list(ends)
-        if file_uebernacht is not None:
-            try:
-                df_ue = load_file(file_uebernacht)
-                df_ue.columns = [str(c).strip().lower() for c in df_ue.columns]
-                c_vehicle = find_column(df_ue, ("fahrzeug", "auto", "fahrer"))
-                c_day = find_column(df_ue, ("datum", "tag"))
-                c_address = find_column(df_ue, ("adresse", "hotel", "unterkunft", "ort", "start", "strasse"))
-                if not (c_vehicle and c_day and c_address):
-                    st.warning("Start-/Übernachtungsdatei ignoriert: Spalten für Fahrzeug, Datum und Adresse/Hotel fehlen.")
-                else:
-                    df_ue["_datum"] = pd.to_datetime(df_ue[c_day], errors="coerce").dt.normalize()
-                    chosen_date = pd.Timestamp(planungs_datum).normalize()
-                    unknown_vehicles = set()
-                    for _, row in df_ue.iterrows():
-                        vehicle_idx = match_vehicle_name(row[c_vehicle], fahrzeug_namen)
-                        if vehicle_idx is None and not is_blank(row[c_vehicle]):
-                            unknown_vehicles.add(str(row[c_vehicle]))
-                            continue
-                        address = clean_address(row[c_address])
-                        if vehicle_idx is not None and pd.notna(row["_datum"]) and row["_datum"] == chosen_date and address:
-                            final_starts[vehicle_idx] = address
-                            final_ends[vehicle_idx] = address
-                    if unknown_vehicles:
-                        st.warning("Diese Fahrzeugnamen aus der Start-/Übernachtungsdatei wurden nicht zugeordnet: " + ", ".join(sorted(unknown_vehicles)))
-            except Exception as exc:
-                st.warning(f"Start-/Übernachtungsdatei konnte nicht sauber verarbeitet werden: {exc}. Bitte vor Verwendung der Tour prüfen.")
 
         active_vehicles = [idx for idx in range(num_vehicles) if not on_vacation[idx]]
         vacation_vehicles = [idx for idx in range(num_vehicles) if on_vacation[idx]]
@@ -617,7 +877,7 @@ if st.session_state.berechnen_geklickt:
                     unknown_areas = set()
                     for _, row in df_g.iterrows():
                         area_name = "" if is_blank(row[c_area]) else str(row[c_area]).strip()
-                        vehicle_idx = match_vehicle_name(row[c_vehicle], fahrzeug_namen)
+                        vehicle_idx = match_vehicle_name(row[c_vehicle], fahrzeug_namen, vehicle_aliases)
                         if area_name and vehicle_idx is None and not is_blank(row[c_vehicle]):
                             unknown_areas.add(str(row[c_vehicle]))
                         if area_name and vehicle_idx is not None and vehicle_idx in active_vehicles:
@@ -773,26 +1033,185 @@ if st.session_state.berechnen_geklickt:
             st.error("Für diesen Tag konnte keine gültige Lösung gefunden werden. Bitte Adressen, Schichtzeiten, Zeitfenster und Kilometerlimit prüfen.")
             st.stop()
 
-        dropped: list[str] = []
+        # Die tatsächlich vom Solver zugewiesenen Kunden einsammeln, damit die
+        # Kundenübersicht Fahrer, Reihenfolge und berechnete Ankunftszeit anzeigen kann.
+        customer_assignments: dict[int, dict[str, Any]] = {}
+        for solver_vehicle_idx, original_vehicle_idx in enumerate(active_vehicles):
+            route_index = routing.Start(solver_vehicle_idx)
+            stop_number = 0
+            while not routing.IsEnd(route_index):
+                route_node = manager.IndexToNode(route_index)
+                if route_node >= customer_base:
+                    customer_idx = route_node - customer_base
+                    stop_number += 1
+                    arrival_min = int(solution.Min(time_dimension.CumulVar(route_index)))
+                    customer_assignments[customer_idx] = {
+                        "Fahrer / Fahrzeug": fahrzeug_namen[original_vehicle_idx],
+                        "Stopp Nr.": stop_number,
+                        "Geplante Ankunft": format_time(arrival_min),
+                        "Status": "In Tour eingeplant",
+                    }
+                route_index = solution.Value(routing.NextVar(route_index))
+
+        # Liste der nicht eingeplanten Kunden mit konkreten Daten. Der Solver kann
+        # nicht immer genau einen Grund bestimmen; deshalb keinen Grund erfinden.
+        unserved_rows: list[dict[str, str]] = []
         for customer_idx in range(len(df_clean)):
             node = customer_base + customer_idx
             index = manager.NodeToIndex(node)
             if solution.Value(routing.NextVar(index)) == index:
-                dropped.append(f"{df_clean.iloc[customer_idx]['Name']} ({df_clean.iloc[customer_idx]['Adresse']})")
-        if dropped:
+                customer = df_clean.iloc[customer_idx]
+                earliest = customer_earliest[customer_idx]
+                latest = customer_latest[customer_idx]
+                unserved_rows.append({
+                    "Kundenname": str(customer["Name"]),
+                    "Adresse": str(customer["Adresse"]),
+                    "Zeitfenster": f"{format_time(earliest)}–{format_time(latest)}",
+                    "Gebiet": "" if is_blank(customer.get("Gebiet", "")) else str(customer.get("Gebiet", "")),
+                    "Status": "Nicht in Tagesroute eingeplant",
+                    "Hinweis": "Zeitfenster, Schicht, Kilometerlimit und Tourenplanung prüfen.",
+                })
+
+        if unserved_rows:
             st.warning(
-                "⚠️ Diese Kunden wurden heute nicht eingeplant und müssen manuell geprüft bzw. für einen späteren Tag vorgemerkt werden: "
-                + "; ".join(dropped)
+                f"⚠️ {len(unserved_rows)} Kunde(n) wurden heute nicht in eine Tour aufgenommen. "
+                "Bitte die Liste prüfen und gegebenenfalls für einen anderen Tag einplanen."
+            )
+
+        # Kundenübersicht nach erfolgter Berechnung: die Zuordnung ist erst jetzt bekannt.
+        assignment_rows: list[dict[str, str]] = []
+        for customer_idx, customer in df_clean.iterrows():
+            assignment = customer_assignments.get(customer_idx)
+            if assignment:
+                driver = str(assignment["Fahrer / Fahrzeug"])
+                stop_number = str(assignment["Stopp Nr."])
+                arrival = str(assignment["Geplante Ankunft"])
+                status = str(assignment["Status"])
+            else:
+                driver = "Nicht zugewiesen"
+                stop_number = "—"
+                arrival = "—"
+                status = "Nicht eingeplant"
+            assignment_rows.append({
+                "Kundenname": str(customer["Name"]),
+                "Adresse": str(customer["Adresse"]),
+                "Fahrer / Fahrzeug": driver,
+                "Stopp Nr.": stop_number,
+                "Geplante Ankunft": arrival,
+                "Zeitfenster": f"{format_time(customer_earliest[customer_idx])}–{format_time(customer_latest[customer_idx])}",
+                "Gebiet": "" if is_blank(customer.get("Gebiet", "")) else str(customer.get("Gebiet", "")),
+                "Status": status,
+            })
+
+        st.subheader("📋 Kundenübersicht mit Fahrerzuordnung")
+        st.caption("Diese Übersicht zeigt die vom Solver berechnete Zuordnung. Nicht eingeplante Kunden stehen ohne Fahrer in der Liste.")
+        df_assignment = pd.DataFrame(assignment_rows)
+        st.dataframe(df_assignment, use_container_width=True, hide_index=True)
+        # Gut lesbare Kundenübersicht als normale TXT-Datei (direkt in Windows-Editor lesbar).
+        assignment_report_lines = [
+            "ROUTENPLANER - KUNDENÜBERSICHT",
+            f"Planungsdatum: {planungs_datum.strftime('%d.%m.%Y')}",
+            "=" * 72,
+            "",
+            f"Kunden insgesamt: {len(assignment_rows)}",
+            f"In Tagesrouten eingeplant: {len(customer_assignments)}",
+            f"Nicht in Tagesrouten eingeplant: {len(unserved_rows)}",
+            "",
+            "HINWEIS: Die Ankunftszeiten sind Planwerte. Bitte vor der Fahrt die Adressen und Zeiten kontrollieren.",
+            "",
+            "KUNDENLISTE",
+            "=" * 72,
+            "",
+        ]
+        for row_number, item in enumerate(assignment_rows, start=1):
+            assignment_report_lines.extend([
+                f"{row_number:02d}. {item['Kundenname']}",
+                f"    Adresse: {item['Adresse']}",
+                f"    Fahrer / Fahrzeug: {item['Fahrer / Fahrzeug']}",
+                f"    Stoppnummer: {item['Stopp Nr.']}",
+                f"    Geplante Ankunft: {item['Geplante Ankunft']}",
+                f"    Vereinbartes Zeitfenster: {item['Zeitfenster']}",
+                f"    Gebiet: {item['Gebiet'] or 'Keine Angabe'}",
+                f"    Status: {item['Status']}",
+                "",
+                "-" * 72,
+                "",
+            ])
+        assignment_txt = encode_readable_txt("\n".join(assignment_report_lines))
+        st.download_button(
+            label="📄 Kundenliste mit Fahrerzuordnung als TXT herunterladen",
+            data=assignment_txt,
+            file_name=f"kunden_fahrerzuordnung_{planungs_datum.strftime('%Y-%m-%d')}.txt",
+            mime="text/plain; charset=utf-8",
+            key="download_customer_assignments_txt",
+        )
+
+        # Eine eigene, lesbare TXT-Liste für Kunden, die nicht in eine Tagesroute passten.
+        unserved_report_lines = [
+            "ROUTENPLANER - NICHT IN TAGESROUTEN EINGEPLANTE KUNDEN",
+            f"Planungsdatum: {planungs_datum.strftime('%d.%m.%Y')}",
+            "=" * 72,
+            "",
+        ]
+        if unserved_rows:
+            unserved_report_lines.extend([
+                f"Anzahl nicht eingeplanter Kunden: {len(unserved_rows)}",
+                "Diese Kunden wurden vom Optimierer nicht in die berechneten Tagesrouten aufgenommen.",
+                "Der genaue Grund ist nicht immer eindeutig. Bitte Zeitfenster, Schichtzeiten, Kilometerlimit und Adressen prüfen.",
+                "",
+            ])
+            for row_number, item in enumerate(unserved_rows, start=1):
+                unserved_report_lines.extend([
+                    f"{row_number:02d}. {item['Kundenname']}",
+                    f"    Adresse: {item['Adresse']}",
+                    f"    Gewünschtes Zeitfenster: {item['Zeitfenster']}",
+                    f"    Gebiet: {item['Gebiet'] or 'Keine Angabe'}",
+                    f"    Status: {item['Status']}",
+                    f"    Bitte prüfen: {item['Hinweis']}",
+                    "",
+                    "-" * 72,
+                    "",
+                ])
+        else:
+            unserved_report_lines.extend([
+                "GUTE NACHRICHT: Alle Kunden wurden in die berechneten Tagesrouten aufgenommen.",
+                "Es gibt keine Kunden in dieser Liste.",
+                "",
+            ])
+        unserved_txt = encode_readable_txt("\n".join(unserved_report_lines))
+
+        with st.expander(f"📋 Liste der heute nicht in eine Tour eingeplanten Kunden ({len(unserved_rows)})", expanded=False):
+            if unserved_rows:
+                st.caption(
+                    "Diese Kunden wurden vom Optimierer nicht in die Tagesrouten aufgenommen. "
+                    "Der genaue Grund ist nicht immer eindeutig; Zeitfenster, Schichtzeiten, Kilometerlimit und Adressen prüfen."
+                )
+                df_unserved = pd.DataFrame(unserved_rows)
+                st.dataframe(df_unserved, use_container_width=True, hide_index=True)
+            else:
+                st.success("Alle Kunden wurden in die berechneten Tagesrouten aufgenommen.")
+            st.download_button(
+                label="📄 Liste der nicht eingeplanten Kunden als TXT herunterladen",
+                data=unserved_txt,
+                file_name=f"nicht_eingeplante_kunden_{planungs_datum.strftime('%Y-%m-%d')}.txt",
+                mime="text/plain; charset=utf-8",
+                key="download_unserved_customers_txt",
             )
 
         colors = ["blue", "red", "green", "purple", "orange", "darkred", "cadetblue", "darkgreen", "pink", "black"]
-        export_rows: list[dict[str, Any]] = []
+        route_report_sections: list[str] = []
 
         for solver_vehicle_idx, original_vehicle_idx in enumerate(active_vehicles):
             st.markdown(f"### 🚚 {fahrzeug_namen[original_vehicle_idx]}")
             col_route, col_map = st.columns([1, 1])
             index = routing.Start(solver_vehicle_idx)
             route_text_lines: list[str] = []
+            route_plain_lines: list[str] = [
+                f"FAHRER / FAHRZEUG: {fahrzeug_namen[original_vehicle_idx]}",
+                "-" * 72,
+                "",
+            ]
+            route_stop_number = 0
             route_distance_m = 0
             route_nodes: list[int] = []
 
@@ -804,12 +1223,30 @@ if st.session_state.berechnen_geklickt:
                     route_text_lines.append(
                         f"- **Start:** {active_starts[solver_vehicle_idx]} (Abfahrt: {format_time(arrival_min)})"
                     )
+                    route_plain_lines.extend([
+                        "START",
+                        f"Adresse: {active_starts[solver_vehicle_idx]}",
+                        f"Abfahrt: {format_time(arrival_min)}",
+                        "",
+                        "KUNDENSTOPPS",
+                        "=" * 72,
+                        "",
+                    ])
                 elif node >= customer_base:
                     customer_idx = node - customer_base
                     row = df_clean.iloc[customer_idx]
+                    route_stop_number += 1
                     route_text_lines.append(
                         f"- **Kunde:** {row['Name']} — *{row['Adresse']}* (Ankunft: {format_time(arrival_min)})"
                     )
+                    route_plain_lines.extend([
+                        f"STOPP {route_stop_number:02d}: {row['Name']}",
+                        f"    Adresse: {row['Adresse']}",
+                        f"    Geplante Ankunft: {format_time(arrival_min)}",
+                        f"    Vereinbartes Zeitfenster: {format_time(customer_earliest[customer_idx])} bis {format_time(customer_latest[customer_idx])}",
+                        f"    Servicezeit vor Ort: {service_time_mins} Minuten",
+                        "",
+                    ])
 
                 next_index = solution.Value(routing.NextVar(index))
                 next_node = manager.IndexToNode(next_index)
@@ -829,16 +1266,19 @@ if st.session_state.berechnen_geklickt:
                 f"🏁 **Gesamtstrecke:** {route_distance_m / 1000:.1f} km (Limit: {max_km_pro_tag} km)"
             )
             route_text = "\n".join(route_text_lines)
-
-            export_rows.append(
-                {
-                    "Datum": planungs_datum.strftime("%Y-%m-%d"),
-                    "Fahrzeug": fahrzeug_namen[original_vehicle_idx],
-                    "Route_Details": route_text.replace("\n", " | "),
-                    "Strecke_KM": round(route_distance_m / 1000, 1),
-                    "Rückkehr": format_time(end_arrival_min),
-                }
-            )
+            route_plain_lines.extend([
+                "RÜCKKEHR",
+                f"Adresse: {active_ends[solver_vehicle_idx]}",
+                f"Ankunft: {format_time(end_arrival_min)}",
+                "",
+                "TOURENÜBERSICHT",
+                f"Anzahl Kundenstopps: {route_stop_number}",
+                f"Gesamtstrecke: {route_distance_m / 1000:.1f} km",
+                f"Kilometerlimit für dieses Fahrzeug: {max_km_pro_tag} km",
+                "",
+                "",
+            ])
+            route_report_sections.append("\n".join(route_plain_lines))
 
             with col_route:
                 st.markdown(route_text)
@@ -891,16 +1331,59 @@ if st.session_state.berechnen_geklickt:
                     st_folium(map_obj, width=500, height=400, returned_objects=[], key=f"map_{original_vehicle_idx}")
             st.divider()
 
-        if export_rows:
-            df_export = pd.DataFrame(export_rows)
-            csv_data = df_export.to_csv(sep=";", index=False).encode("utf-8-sig")
-            st.success("🎉 Die Tagesplanung wurde berechnet. Bitte die Adress-Treffer und ausgelassenen Kunden vor dem Einsatz kontrollieren.")
+        if route_report_sections:
+            day_report_lines = [
+                "ROUTENPLANER - TAGESBERICHT",
+                f"Planungsdatum: {planungs_datum.strftime('%d.%m.%Y')}",
+                "=" * 72,
+                "",
+                "KURZÜBERSICHT",
+                f"Fahrzeuge im Einsatz: {len(active_vehicles)}",
+                f"Kunden insgesamt: {len(df_clean)}",
+                f"In Touren eingeplant: {len(customer_assignments)}",
+                f"Nicht in Touren eingeplant: {len(unserved_rows)}",
+                f"Servicezeit pro Kunde: {service_time_mins} Minuten",
+                f"Maximale Strecke pro Fahrzeug: {max_km_pro_tag} km",
+                "",
+                "BITTE BEACHTEN",
+                "Die Zeiten und Strecken sind berechnete Planwerte. Bitte Adressen, Zeitfenster und nicht eingeplante Kunden vor dem Einsatz kontrollieren.",
+                "",
+                "=" * 72,
+                "TOUREN NACH FAHRZEUG",
+                "=" * 72,
+                "",
+            ]
+            day_report_lines.extend(route_report_sections)
+            day_report_lines.extend([
+                "",
+                "=" * 72,
+                "NICHT IN TAGESROUTEN EINGEPLANTE KUNDEN",
+                "=" * 72,
+                "",
+            ])
+            if unserved_rows:
+                for row_number, item in enumerate(unserved_rows, start=1):
+                    day_report_lines.extend([
+                        f"{row_number:02d}. {item['Kundenname']}",
+                        f"    Adresse: {item['Adresse']}",
+                        f"    Zeitfenster: {item['Zeitfenster']}",
+                        f"    Gebiet: {item['Gebiet'] or 'Keine Angabe'}",
+                        f"    Hinweis: {item['Hinweis']}",
+                        "",
+                    ])
+            else:
+                day_report_lines.append("Alle Kunden wurden in die berechneten Tagesrouten aufgenommen.")
+                day_report_lines.append("")
+
+            day_report_txt = encode_readable_txt("\n".join(day_report_lines))
+            st.success("🎉 Die Tagesplanung wurde berechnet. Du kannst die Berichte als normale TXT-Dateien herunterladen und mit dem Windows-Editor öffnen.")
             st.download_button(
-                label="📥 Route für diesen Tag als CSV herunterladen",
-                data=csv_data,
-                file_name=f"tour_{planungs_datum.strftime('%Y-%m-%d')}.csv",
-                mime="text/csv; charset=utf-8",
+                label="📄 Gesamten Tagesbericht als TXT herunterladen",
+                data=day_report_txt,
+                file_name=f"tagesbericht_{planungs_datum.strftime('%Y-%m-%d')}.txt",
+                mime="text/plain; charset=utf-8",
                 type="primary",
+                key="download_day_report_txt",
             )
 
     except Exception as exc:
